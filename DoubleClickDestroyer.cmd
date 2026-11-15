@@ -112,6 +112,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Net.WebSockets;
+using System.Threading.Tasks;
 using System.Threading;
 
 namespace Dcd
@@ -381,6 +383,134 @@ namespace Dcd
         }
     }
 
+    // ------------------------------------------------------------ G HUB's local interface
+    // The G HUB window talks to its background service over ws://localhost:9010. The tool uses
+    // the same messages to create, read and write a profile's script by its id.
+
+    public class GHubApi
+    {
+        ClientWebSocket ws;
+        int next;
+        readonly byte[] buf = new byte[1 << 16];
+
+        public bool Open { get { return ws != null && ws.State == WebSocketState.Open; } }
+
+        public static GHubApi Connect(int timeoutMs)
+        {
+            DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
+            while (true)
+            {
+                GHubApi api = new GHubApi();
+                try
+                {
+                    api.ws = new ClientWebSocket();
+                    api.ws.Options.AddSubProtocol("json");
+                    api.ws.Options.SetRequestHeader("Origin", "file://");
+                    if (api.ws.ConnectAsync(new Uri("ws://localhost:9010"), CancellationToken.None).Wait(5000) && api.Open) return api;
+                }
+                catch (Exception) { }
+                if (DateTime.Now > deadline) return null;
+                Thread.Sleep(1000);
+            }
+        }
+
+        string Receive(int timeoutMs)
+        {
+            using (MemoryStream message = new MemoryStream())
+            {
+                while (true)
+                {
+                    Task<WebSocketReceiveResult> t = ws.ReceiveAsync(new ArraySegment<byte>(buf), CancellationToken.None);
+                    bool done;
+                    try { done = t.Wait(timeoutMs); }
+                    catch (AggregateException) { throw new Abort("Lost the connection to G HUB."); }
+                    if (!done) { ws.Abort(); throw new Abort("G HUB did not answer."); }
+                    if (t.Result.MessageType == WebSocketMessageType.Close) throw new Abort("G HUB closed the connection.");
+                    message.Write(buf, 0, t.Result.Count);
+                    if (t.Result.EndOfMessage) return Encoding.UTF8.GetString(message.ToArray());
+                }
+            }
+        }
+
+        public static string Q(string s)
+        {
+            StringBuilder b = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                if (c == '"') b.Append("\\\"");
+                else if (c == '\\') b.Append("\\\\");
+                else if (c == '\n') b.Append("\\n");
+                else if (c == '\r') b.Append("\\r");
+                else if (c == '\t') b.Append("\\t");
+                else if (c < 0x20 || c > 0x7e) b.Append("\\u").Append(((int)c).ToString("x4"));
+                else b.Append(c);
+            }
+            return b.Append('"').ToString();
+        }
+
+        JNode Call(string verb, string path, string type, string fields)
+        {
+            string id = "dcd" + (++next);
+            string msg = "{\"msgId\":\"" + id + "\",\"verb\":\"" + verb + "\",\"path\":\"" + path + "\"" +
+                         (type == null ? "" : ",\"payload\":{\"@type\":\"type.googleapis.com/logi.protocol." + type + "\"," + fields + "}") + "}";
+            byte[] bytes = Encoding.UTF8.GetBytes(msg);
+            try
+            {
+                if (!ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None).Wait(10000))
+                    throw new Abort("G HUB did not accept the request.");
+            }
+            catch (AggregateException) { throw new Abort("Lost the connection to G HUB."); }
+            DateTime deadline = DateTime.Now.AddSeconds(15);
+            while (true)
+            {
+                int left = (int)(deadline - DateTime.Now).TotalMilliseconds;
+                if (left <= 0) throw new Abort("G HUB did not answer (" + path + ").");
+                JNode reply = JParser.Parse(Receive(left));
+                if (reply.S("msgId") != id) continue;   // G HUB also sends unrelated notifications
+                JNode result = reply.Get("result");
+                string code = result == null ? null : result.S("code");
+                if (code != "SUCCESS")
+                    throw new Abort("G HUB refused " + path + " (" + code + ": " + (result == null ? "" : result.S("what")) + ").");
+                return reply.Get("payload") ?? new JNode();
+            }
+        }
+
+        // The profile's script id, or "" when it has none. A profile can still point at a script that
+        // was deleted in G HUB; that counts as none.
+        public string ScriptIdOf(string profileId)
+        {
+            string id = Call("GET", "/profile/script_id", "profiles.ProfileId", "\"id\":" + Q(profileId)).S("scriptId") ?? "";
+            if (id.Length == 0) return "";
+            JNode scripts = CallNoPayload("GET", "/scripts").Get("scripts");
+            return scripts != null && scripts.Get(id) != null ? id : "";
+        }
+
+        JNode CallNoPayload(string verb, string path)
+        {
+            return Call(verb, path, null, null);
+        }
+
+        public string NewScript(string profileId, string name)
+        {
+            string id = Call("GET", "/script/new", "scripting.ScriptNew",
+                             "\"profileId\":" + Q(profileId) + ",\"name\":" + Q(name) + ",\"description\":\"\"").S("scriptId");
+            if (string.IsNullOrEmpty(id)) throw new Abort("G HUB did not create a script.");
+            return id;
+        }
+
+        public string ReadScript(string scriptId)
+        {
+            return Call("GET", "/script/editor/content", "scripting.ScriptID", "\"scriptId\":" + Q(scriptId)).S("content") ?? "";
+        }
+
+        public void WriteScript(string scriptId, string content)
+        {
+            string saved = Call("SET", "/script/editor/content", "scripting.ScriptContent",
+                                "\"scriptId\":" + Q(scriptId) + ",\"content\":" + Q(content)).S("content");
+            if (saved != content) throw new Abort("G HUB did not save the script correctly. Nothing else was changed.");
+        }
+    }
+
     // ------------------------------------------------------------ the tool
 
     class Btn
@@ -454,6 +584,7 @@ namespace Dcd
             BackupRoot = string.IsNullOrEmpty(testDir) ? System.IO.Path.Combine(local, @"dcd5000\backups")
                                                        : LghubDir.TrimEnd('\\') + "-dcd-backups";
             ManageGhub = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DCD_NO_GHUB"));
+            Live = string.IsNullOrEmpty(testDir);
             try
             {
                 Loop();
@@ -689,11 +820,9 @@ namespace Dcd
 
         // Disable period per button, as written in our script. Scripts from older versions of
         // this tool have one DEBOUNCE_MS for all buttons instead.
-        static Dictionary<int, int> CurrentPeriods(string scriptDir)
+        static Dictionary<int, int> CurrentPeriods(string text)
         {
             Dictionary<int, int> periods = new Dictionary<int, int>();
-            if (scriptDir == null) return periods;
-            string text = ReadText(System.IO.Path.Combine(scriptDir, "script.lua"));
             if (!IsOurs(text)) return periods;
             Match global = Regex.Match(text, @"DEBOUNCE_MS\s*=\s*(\d+)");
             foreach (Match m in Regex.Matches(text, @"^\s*\[(\d+)\]\s*=\s*\{(.*)\}\s*,?\s*$", RegexOptions.Multiline))
@@ -782,6 +911,82 @@ namespace Dcd
             Process.Start(psi);
         }
 
+        // -------------------------------------------------------- talking to G HUB
+
+        static bool Live;          // false only when testing on a copy of G HUB's folder
+        static GHubApi Conn;
+
+        static GHubApi Api()
+        {
+            if (Conn != null && Conn.Open) return Conn;
+            Conn = GHubApi.Connect(30000);
+            if (Conn == null) throw new Abort("Could not connect to G HUB. Make sure G HUB is running, then try again.");
+            return Conn;
+        }
+
+        static string ScriptIdOf(JNode profile)
+        {
+            return Live ? Api().ScriptIdOf(profile.S("id")) : (profile.S("scriptId") ?? "");
+        }
+
+        static string ReadProfileScript(JNode profile)
+        {
+            if (ScriptIdOf(profile).Length == 0) return "";
+            if (Live) return Api().ReadScript(ScriptIdOf(profile)).Replace("\r\n", "\n");
+            string dir = FindScriptDir(false);
+            return dir == null ? "" : ReadText(System.IO.Path.Combine(dir, "script.lua"));
+        }
+
+        // G HUB saves a new script's id into the profile shortly after creating it. Wait for that,
+        // because the settings are edited while G HUB is closed.
+        static void WaitForScriptInSettings(string profileId, string scriptId)
+        {
+            DateTime deadline = DateTime.Now.AddSeconds(15);
+            while (true)
+            {
+                IntPtr db;
+                JNode profile = FindProfile(LoadFile(false, out db).Root, profileId);
+                Sql.Close(db);
+                if (profile != null && profile.S("scriptId") == scriptId) return;
+                if (DateTime.Now > deadline) throw new Abort("G HUB created the script but did not save it in time. Nothing else was changed; try again.");
+                Thread.Sleep(500);
+            }
+        }
+
+        // Button actions the script has to perform, from the current settings.
+        static SortedDictionary<int, string> ActionsFor(string profileId, Dictionary<int, int> wanted)
+        {
+            IntPtr db;
+            JNode root = LoadFile(false, out db).Root;
+            Sql.Close(db);
+            JNode profile = FindProfile(root, profileId);
+            if (profile == null) throw new Abort("The profile disappeared. Nothing was changed.");
+            SortedDictionary<int, Btn> buttons = Buttons(root, profile);
+            SortedDictionary<int, string> actions = new SortedDictionary<int, string>();
+            foreach (int n in wanted.Keys)
+            {
+                Btn b;
+                if (!buttons.TryGetValue(n, out b) || b.Action == null || (!b.Fixed && b.Busy))
+                    throw new Abort("G" + n + " cannot be handled. Nothing was changed.");
+                actions[n] = b.Action;
+            }
+            return actions;
+        }
+
+        // Put the previous script back into its file, found by its new content (G HUB is closed then).
+        static void RestoreScriptFile(string newContent, string oldContent)
+        {
+            try
+            {
+                foreach (string d in ScriptDirs())
+                {
+                    string f = System.IO.Path.Combine(d, "script.lua");
+                    if (ReadText(f).Replace("\r\n", "\n") == newContent) File.WriteAllText(f, oldContent, new UTF8Encoding(false));
+                }
+            }
+            catch (Exception) { }
+        }
+
         // -------------------------------------------------------- the change itself
 
         static string ApplyEdits(string text, List<KeyValuePair<JNode, string>> edits)
@@ -806,17 +1011,44 @@ namespace Dcd
 
         // Make exactly the buttons in "wanted" (button -> ignore time in ms) debounced on this profile.
         // Empty = remove the fix. Returns the backup folder.
+        //
+        // Order: the script is created/written through G HUB first, then G HUB is closed, the button
+        // assignments are switched in its settings, and G HUB is started again, loading both.
         static string ApplyChange(string profileId, Dictionary<int, int> wanted)
         {
+            string stamp = System.IO.Path.Combine(BackupRoot, DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+            string backup = stamp;
+            for (int i = 2; Directory.Exists(backup); i++) backup = stamp + "-" + i;
+            Directory.CreateDirectory(backup);
+            CopyDir(System.IO.Path.Combine(LghubDir, "scripts"), System.IO.Path.Combine(backup, "scripts"));
+
+            string oldContent = null, newContent = null, scriptId = "";
+            if (Live)
+            {
+                scriptId = Api().ScriptIdOf(profileId);
+                if (scriptId.Length == 0 && wanted.Count > 0)
+                {
+                    Console.WriteLine(" Creating a G HUB script for this profile...");
+                    scriptId = Api().NewScript(profileId, Marker);
+                    WaitForScriptInSettings(profileId, scriptId);
+                }
+                if (scriptId.Length > 0)
+                {
+                    SortedDictionary<int, string> scriptActions = ActionsFor(profileId, wanted);
+                    oldContent = Api().ReadScript(scriptId);
+                    newContent = scriptActions.Count > 0 ? RenderLua(wanted, scriptActions) : Stub;
+                    File.WriteAllText(System.IO.Path.Combine(backup, "previous-script.lua"), oldContent, new UTF8Encoding(false));
+                    Api().WriteScript(scriptId, newContent);
+                    Console.WriteLine(" Script saved in G HUB.");
+                }
+            }
+
             bool wasRunning = ManageGhub && GhubRunning();
-            if (wasRunning) { Console.WriteLine("Closing G HUB..."); StopGhub(); }
+            if (wasRunning) { Console.WriteLine(" Closing G HUB..."); StopGhub(); }
             try
             {
-                string backup = System.IO.Path.Combine(BackupRoot, DateTime.Now.ToString("yyyyMMdd-HHmmss"));
-                Directory.CreateDirectory(backup);
                 foreach (string f in Directory.GetFiles(LghubDir, "settings.db*"))
                     File.Copy(f, System.IO.Path.Combine(backup, System.IO.Path.GetFileName(f)), true);
-                CopyDir(System.IO.Path.Combine(LghubDir, "scripts"), System.IO.Path.Combine(backup, "scripts"));
                 Console.WriteLine(" Backup saved: " + backup);
 
                 string scriptDir = null;
@@ -826,9 +1058,16 @@ namespace Dcd
                 try
                 {
                     JNode profile = FindProfile(st.Root, profileId);
-                    if (profile == null || profile.S("scriptId") == null) throw new Abort("The profile or its script disappeared. Nothing was changed.");
-                    scriptDir = FindScriptDir(true);
-                    if (scriptDir == null) throw new Abort("Could not find the profile's script folder. Nothing was changed.");
+                    if (profile == null) throw new Abort("The profile disappeared. Nothing was changed.");
+                    if (wanted.Count > 0 && string.IsNullOrEmpty(profile.S("scriptId")))
+                        throw new Abort("The profile has no G HUB script. Nothing was changed.");
+                    if (Live && scriptId.Length > 0 && profile.S("scriptId") != scriptId)
+                        throw new Abort("G HUB has not saved the profile's script yet. Nothing was changed; try again.");
+                    if (!Live)
+                    {
+                        scriptDir = FindScriptDir(true);
+                        if (scriptDir == null) throw new Abort("Could not find the profile's script folder. Nothing was changed.");
+                    }
 
                     SortedDictionary<int, Btn> buttons = Buttons(st.Root, profile);
                     foreach (int n in wanted.Keys)
@@ -865,22 +1104,20 @@ namespace Dcd
                 }
                 finally { Sql.Close(db); }
 
-                try
-                {
+                if (!Live)
                     File.WriteAllText(System.IO.Path.Combine(scriptDir, "script.lua"),
                                       actions.Count > 0 ? RenderLua(wanted, actions) : Stub, new UTF8Encoding(false));
-                }
-                catch (Exception e)
-                {
-                    throw new Abort("Button settings were changed but the script could not be written (" + e.Message +
-                                    ").\nRestore the backup in " + backup + " if the buttons misbehave.");
-                }
-                return backup;
+            }
+            catch (Exception)
+            {
+                if (newContent != null) RestoreScriptFile(newContent, oldContent);
+                throw;
             }
             finally
             {
-                if (wasRunning) { Console.WriteLine("Starting G HUB..."); StartGhub(); }
+                if (wasRunning) { Console.WriteLine(" Starting G HUB..."); StartGhub(); Conn = null; }
             }
+            return backup;
         }
 
         // -------------------------------------------------------- screen
@@ -1069,7 +1306,7 @@ namespace Dcd
         static void BuildRows()
         {
             Profile = Profiles[ProfileIndex];
-            Dictionary<int, int> periods = CurrentPeriods(FindScriptDir(false));
+            Dictionary<int, int> periods = CurrentPeriods(ReadProfileScript(Profile));
             Rows = new List<Row>();
             foreach (Btn b in Buttons(Root, Profile).Values)
             {
@@ -1170,7 +1407,7 @@ namespace Dcd
 
             if (wanted.Count > 0)
             {
-                if (Profile.S("scriptId") == null)
+                if (!Live && ScriptIdOf(Profile).Length == 0)
                 {
                     Msg = "This profile has no G HUB script yet, and only G HUB can create one:\n" +
                           "In G HUB open this profile > Scripting > create a new Lua script > save it empty.\n" +
@@ -1178,8 +1415,7 @@ namespace Dcd
                     MsgColor = ConsoleColor.Yellow;
                     return;
                 }
-                string sd = FindScriptDir(false);
-                string existing = sd == null ? "" : ReadText(System.IO.Path.Combine(sd, "script.lua"));
+                string existing = ReadProfileScript(Profile);
                 if (existing.Length > 0 && !IsOurs(existing) && !IsBlankScript(existing)
                     && !Confirm("This profile already has a G HUB script of your own. Replace it? (a backup is kept)"))
                     return;
@@ -1206,7 +1442,7 @@ namespace Dcd
                 MsgColor = ConsoleColor.Red;
                 return;
             }
-            if (ManageGhub) { Console.WriteLine(" Waiting for G HUB to start..."); Thread.Sleep(3000); }
+            if (Live) { Console.WriteLine(" Waiting for G HUB to start..."); Thread.Sleep(2000); Api(); }
             LoadState(profileId);
             ClearScreen();
             Msg = (wanted.Count > 0 ? "Applied. Try the buttons now." : "Fix removed. Your buttons are back to normal.") +
@@ -1219,6 +1455,12 @@ namespace Dcd
             if (!File.Exists(DbPath)) throw new Abort("G HUB settings not found at " + DbPath + ". Is Logitech G HUB installed?");
             Interactive = !Console.IsInputRedirected && !Console.IsOutputRedirected;
             BaseBg = Console.BackgroundColor;
+            if (Live)
+            {
+                if (!GhubRunning()) { Console.WriteLine(" Starting G HUB..."); StartGhub(); Thread.Sleep(2000); }
+                Console.WriteLine(" Connecting to G HUB...");
+                Api();
+            }
             ClearScreen();
             LoadState(null);
             try

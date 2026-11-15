@@ -2,3 +2,5 @@
 backups/
 # Output of tools/clicklog.ps1
 tools/clicklog-*.csv
+# Personal draft, not part of the project
+post.md
