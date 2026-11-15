@@ -1,0 +1,4 @@
+# Local copies of G HUB settings (contain personal data)
+backups/
+# Output of tools/clicklog.ps1
+tools/clicklog-*.csv
