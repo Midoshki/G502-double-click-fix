@@ -498,6 +498,13 @@ namespace Dcd
             return id;
         }
 
+        // Connected devices as G HUB reports them (displayName, slotPrefix, onboardMode, ...).
+        public List<JNode> Devices()
+        {
+            JNode list = CallNoPayload("GET", "/devices/list").Get("deviceInfos");
+            return list == null ? new List<JNode>() : list.Items();
+        }
+
         public string ReadScript(string scriptId)
         {
             return Call("GET", "/script/editor/content", "scripting.ScriptID", "\"scriptId\":" + Q(scriptId)).S("content") ?? "";
@@ -517,8 +524,15 @@ namespace Dcd
     {
         public int N;
         public JNode MainCard, ShiftCard;   // the "cardId" string values of the two slots
-        public bool Fixed, Busy;
-        public string Label, Action;
+        public bool Fixed;                  // our fix is in place: main slot empty, action parked on G-Shift
+        public bool Busy;                   // G-Shift slot used by the user's own action
+        public bool Overridden;             // fixed earlier, then a new action was put on the button in G HUB
+        public bool InScript;               // our script handles this button
+        public bool ParkedExists;           // the parked action still exists in G HUB
+        public string Label, Action;        // what the button does, and the script line for it (null = can't)
+        public string Problem;              // why Action is null, when there is a fixable reason
+        public string Drift;                // how G HUB no longer matches the fix, or null
+        public bool Stale;                  // Drift can be repaired by applying again
     }
 
     class Settings
@@ -537,7 +551,10 @@ namespace Dcd
         const int DefaultClickMs = 50;    // G1-G3: must stay below a deliberate double-click
         static readonly string[] GhubProcesses = { "lghub_system_tray", "lghub", "lghub_agent" };
         const string DefaultTray = @"C:\Program Files\LGHUB\system_tray\lghub_system_tray.exe";
-        static readonly Regex SlotRe = new Regex(@"^(g502[a-z0-9_]*?)_g(\d+)_m1$");
+        static readonly Regex SlotRe = new Regex(@"^([a-z0-9_]+?)_g(\d+)_m1$");
+        // Button-name prefixes of connected mice that G HUB calls "G502" (covers models whose
+        // prefix does not start with g502). Filled from G HUB's device list.
+        static readonly List<string> G502Prefixes = new List<string>();
         static readonly Regex UuidRe = new Regex(@"^[0-9A-Fa-f-]{1,64}$");
         static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, true);
         static readonly Dictionary<int, string> HidKeys = new Dictionary<int, string>();
@@ -555,6 +572,11 @@ namespace Dcd
         }
 
         static bool IsClick(int n) { return n <= 3; }
+
+        static bool IsG502Prefix(string prefix)
+        {
+            return prefix.StartsWith("g502") || G502Prefixes.Contains(prefix);
+        }
 
         static string LghubDir, DbPath, BackupRoot, LuaTemplate, Stub;
         static bool ManageGhub;
@@ -655,16 +677,24 @@ namespace Dcd
             return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
-        static void Describe(JNode root, string cardId, out string label, out string action)
+        static void Describe(JNode root, string cardId, out string label, out string action, out string problem, out bool exists)
         {
             action = null;
+            problem = null;
+            exists = true;
             if (cardId == NoAction) { label = "no action"; return; }
             JNode card = null;
             foreach (JNode c in root.Path("cards", "cards").Items()) if (c.S("id") == cardId) { card = c; break; }
             if (card == null)
             {
                 label = "built-in function";
-                if (!cardId.StartsWith(SynthPrefix) || cardId.Length != SynthPrefix.Length + 12) return;
+                if (!cardId.StartsWith(SynthPrefix) || cardId.Length != SynthPrefix.Length + 12)
+                {
+                    label = "deleted action";
+                    problem = "its action was deleted in G HUB";
+                    exists = false;
+                    return;
+                }
                 int type, code;
                 if (!int.TryParse(cardId.Substring(SynthPrefix.Length, 2), System.Globalization.NumberStyles.HexNumber, null, out type)
                     || !int.TryParse(cardId.Substring(SynthPrefix.Length + 2, 2), System.Globalization.NumberStyles.HexNumber, null, out code))
@@ -688,7 +718,16 @@ namespace Dcd
             if (kind == "SEQUENCE")
             {
                 label = "macro '" + name + "'";
-                if (name.IndexOf('\n') >= 0 || name.IndexOf('\r') >= 0) label += " (name has a line break; rename it)";
+                // Scripts start macros by name, and G HUB allows two macros of one app to share a name.
+                int sameName = 0;
+                string app = card.S("applicationId") ?? "";
+                foreach (JNode c in root.Path("cards", "cards").Items())
+                {
+                    string otherApp = c.S("applicationId") ?? "";
+                    if (c.S("attribute") == "MACRO_PLAYBACK" && c.S("name") == name && (otherApp == app || otherApp == "")) sameName++;
+                }
+                if (name.IndexOf('\n') >= 0 || name.IndexOf('\r') >= 0) problem = "the macro name has a line break; rename it in G HUB";
+                else if (sameName > 1) problem = "another macro has the same name; rename one in G HUB";
                 else action = "macro = " + LuaStr(name);
                 return;
             }
@@ -714,6 +753,13 @@ namespace Dcd
 
         static SortedDictionary<int, Btn> Buttons(JNode root, JNode profile)
         {
+            return Buttons(root, profile, null);
+        }
+
+        // scriptActions: button -> action line in our current script (null when not known). Used to
+        // spot changes made in G HUB after the fix was applied.
+        static SortedDictionary<int, Btn> Buttons(JNode root, JNode profile, Dictionary<int, string> scriptActions)
+        {
             SortedDictionary<int, Btn> result = new SortedDictionary<int, Btn>();
             JNode assignments = profile.Get("assignments");
             if (assignments == null) return result;
@@ -727,7 +773,7 @@ namespace Dcd
             foreach (KeyValuePair<string, JNode> kv in slots)
             {
                 Match m = SlotRe.Match(kv.Key);
-                if (!m.Success) continue;
+                if (!m.Success || !IsG502Prefix(m.Groups[1].Value)) continue;
                 int n = int.Parse(m.Groups[2].Value);
                 JNode shifted;
                 if (n < 1 || !slots.TryGetValue(kv.Key + "_shifted", out shifted)) continue;
@@ -735,9 +781,37 @@ namespace Dcd
                 b.N = n;
                 b.MainCard = kv.Value;
                 b.ShiftCard = shifted;
-                b.Fixed = kv.Value.Str == NoAction && shifted.Str != NoAction;
-                b.Busy = !b.Fixed && shifted.Str != NoAction;
-                Describe(root, b.Fixed ? shifted.Str : kv.Value.Str, out b.Label, out b.Action);
+                b.InScript = scriptActions != null && scriptActions.ContainsKey(n);
+                bool mainEmpty = kv.Value.Str == NoAction, shiftEmpty = shifted.Str == NoAction;
+                b.Fixed = mainEmpty && !shiftEmpty;
+                b.Overridden = !mainEmpty && !shiftEmpty && b.InScript;
+                b.Busy = !mainEmpty && !shiftEmpty && !b.InScript;
+                bool exists;
+                Describe(root, b.Fixed ? shifted.Str : kv.Value.Str, out b.Label, out b.Action, out b.Problem, out exists);
+                b.ParkedExists = b.Fixed && exists;
+
+                if (scriptActions != null)
+                {
+                    string scripted;
+                    scriptActions.TryGetValue(n, out scripted);
+                    if (b.Fixed && b.Action == null)
+                        b.Drift = b.Problem ?? "its action can't be run by a script";   // can't be repaired here
+                    else if (b.Fixed && scripted != b.Action)
+                    {
+                        b.Drift = scripted == null ? "missing from the script" : "its action was changed in G HUB";
+                        b.Stale = true;
+                    }
+                    else if (b.Overridden)
+                    {
+                        b.Drift = "a new action was set on it in G HUB";
+                        b.Stale = true;
+                    }
+                    else if (!b.Fixed && b.InScript)
+                    {
+                        b.Drift = "it was reset in G HUB";
+                        b.Stale = true;
+                    }
+                }
                 result[n] = b;
             }
             return result;
@@ -820,6 +894,16 @@ namespace Dcd
 
         // Disable period per button, as written in our script. Scripts from older versions of
         // this tool have one DEBOUNCE_MS for all buttons instead.
+        // Button -> action line (without the ms part) in our script; empty when the script isn't ours.
+        static Dictionary<int, string> ScriptActions(string text)
+        {
+            Dictionary<int, string> actions = new Dictionary<int, string>();
+            if (!IsOurs(text)) return actions;
+            foreach (Match m in Regex.Matches(text, @"^\s*\[(\d+)\]\s*=\s*\{\s*(.*?)\s*\}\s*,?\s*$", RegexOptions.Multiline))
+                actions[int.Parse(m.Groups[1].Value)] = Regex.Replace(m.Groups[2].Value, @",\s*ms\s*=\s*\d+$", "");
+            return actions;
+        }
+
         static Dictionary<int, int> CurrentPeriods(string text)
         {
             Dictionary<int, int> periods = new Dictionary<int, int>();
@@ -931,10 +1015,11 @@ namespace Dcd
 
         static string ReadProfileScript(JNode profile)
         {
-            if (ScriptIdOf(profile).Length == 0) return "";
-            if (Live) return Api().ReadScript(ScriptIdOf(profile)).Replace("\r\n", "\n");
+            string id = ScriptIdOf(profile);
+            if (id.Length == 0) return "";
+            if (Live) return Api().ReadScript(id).Replace("\r\n", "\n");
             string dir = FindScriptDir(false);
-            return dir == null ? "" : ReadText(System.IO.Path.Combine(dir, "script.lua"));
+            return dir == null ? "" : ReadText(System.IO.Path.Combine(dir, "script.lua")).Replace("\r\n", "\n");
         }
 
         // G HUB saves a new script's id into the profile shortly after creating it. Wait for that,
@@ -953,24 +1038,66 @@ namespace Dcd
             }
         }
 
-        // Button actions the script has to perform, from the current settings.
-        static SortedDictionary<int, string> ActionsFor(string profileId, Dictionary<int, int> wanted)
+        // Decide the settings edits and script actions that make exactly the buttons in "wanted"
+        // fixed, starting from the current state (including changes made in G HUB since).
+        static SortedDictionary<int, string> Plan(SortedDictionary<int, Btn> buttons, Dictionary<int, int> wanted,
+                                                  Dictionary<int, string> scriptActions, List<KeyValuePair<JNode, string>> edits)
+        {
+            foreach (int n in wanted.Keys)
+                if (!buttons.ContainsKey(n)) throw new Abort("Unknown button G" + n + ". Nothing was changed.");
+            SortedDictionary<int, string> actions = new SortedDictionary<int, string>();
+            foreach (Btn b in buttons.Values)
+            {
+                if (wanted.ContainsKey(b.N))
+                {
+                    if (b.Fixed)
+                    {
+                        // Already parked. If G HUB changed it so a script can't run it any more, keep
+                        // the script line as it was rather than guessing.
+                        string act = b.Action;
+                        if (act == null && scriptActions != null) scriptActions.TryGetValue(b.N, out act);
+                        if (act == null) throw new Abort("G" + b.N + " cannot be handled (" + b.Label + "). Nothing was changed.");
+                        actions[b.N] = act;
+                    }
+                    else
+                    {
+                        // Park the button's current action. For a button that got a new action in
+                        // G HUB after the fix, this replaces the old parked action.
+                        if (b.Action == null || b.Busy) throw new Abort("G" + b.N + " cannot be handled (" + b.Label + "). Nothing was changed.");
+                        Swap(edits, b.MainCard, b.ShiftCard);
+                        actions[b.N] = b.Action;
+                    }
+                }
+                else if (b.Fixed)
+                {
+                    if (b.ParkedExists) Swap(edits, b.ShiftCard, b.MainCard);                  // restore
+                    else edits.Add(new KeyValuePair<JNode, string>(b.ShiftCard, NoAction));     // action is gone
+                }
+                else if (b.Overridden)
+                    edits.Add(new KeyValuePair<JNode, string>(b.ShiftCard, NoAction));          // keep the new action
+            }
+            return actions;
+        }
+
+        static Dictionary<int, string> CurrentScriptActions(string profileId)
         {
             IntPtr db;
             JNode root = LoadFile(false, out db).Root;
             Sql.Close(db);
             JNode profile = FindProfile(root, profileId);
             if (profile == null) throw new Abort("The profile disappeared. Nothing was changed.");
-            SortedDictionary<int, Btn> buttons = Buttons(root, profile);
-            SortedDictionary<int, string> actions = new SortedDictionary<int, string>();
-            foreach (int n in wanted.Keys)
-            {
-                Btn b;
-                if (!buttons.TryGetValue(n, out b) || b.Action == null || (!b.Fixed && b.Busy))
-                    throw new Abort("G" + n + " cannot be handled. Nothing was changed.");
-                actions[n] = b.Action;
-            }
-            return actions;
+            return ScriptActions(ReadProfileScript(profile));
+        }
+
+        // Button actions the script has to perform, from the current settings.
+        static SortedDictionary<int, string> ActionsFor(string profileId, Dictionary<int, int> wanted, Dictionary<int, string> scriptActions)
+        {
+            IntPtr db;
+            JNode root = LoadFile(false, out db).Root;
+            Sql.Close(db);
+            JNode profile = FindProfile(root, profileId);
+            if (profile == null) throw new Abort("The profile disappeared. Nothing was changed.");
+            return Plan(Buttons(root, profile, scriptActions), wanted, scriptActions, new List<KeyValuePair<JNode, string>>());
         }
 
         // Put the previous script back into its file, found by its new content (G HUB is closed then).
@@ -1023,6 +1150,7 @@ namespace Dcd
             CopyDir(System.IO.Path.Combine(LghubDir, "scripts"), System.IO.Path.Combine(backup, "scripts"));
 
             string oldContent = null, newContent = null, scriptId = "";
+            Dictionary<int, string> scriptActions = CurrentScriptActions(profileId);
             if (Live)
             {
                 scriptId = Api().ScriptIdOf(profileId);
@@ -1034,9 +1162,9 @@ namespace Dcd
                 }
                 if (scriptId.Length > 0)
                 {
-                    SortedDictionary<int, string> scriptActions = ActionsFor(profileId, wanted);
+                    SortedDictionary<int, string> planned = ActionsFor(profileId, wanted, scriptActions);
                     oldContent = Api().ReadScript(scriptId);
-                    newContent = scriptActions.Count > 0 ? RenderLua(wanted, scriptActions) : Stub;
+                    newContent = planned.Count > 0 ? RenderLua(wanted, planned) : Stub;
                     File.WriteAllText(System.IO.Path.Combine(backup, "previous-script.lua"), oldContent, new UTF8Encoding(false));
                     Api().WriteScript(scriptId, newContent);
                     Console.WriteLine(" Script saved in G HUB.");
@@ -1069,20 +1197,9 @@ namespace Dcd
                         if (scriptDir == null) throw new Abort("Could not find the profile's script folder. Nothing was changed.");
                     }
 
-                    SortedDictionary<int, Btn> buttons = Buttons(st.Root, profile);
-                    foreach (int n in wanted.Keys)
-                        if (!buttons.ContainsKey(n)) throw new Abort("Unknown button G" + n + ". Nothing was changed.");
+                    SortedDictionary<int, Btn> buttons = Buttons(st.Root, profile, scriptActions);
                     List<KeyValuePair<JNode, string>> edits = new List<KeyValuePair<JNode, string>>();
-                    foreach (Btn b in buttons.Values)
-                    {
-                        if (wanted.ContainsKey(b.N))
-                        {
-                            if (b.Action == null || b.Busy) throw new Abort("G" + b.N + " cannot be handled (" + b.Label + "). Nothing was changed.");
-                            if (!b.Fixed) Swap(edits, b.MainCard, b.ShiftCard);
-                            actions[b.N] = b.Action;
-                        }
-                        else if (b.Fixed) Swap(edits, b.ShiftCard, b.MainCard);
-                    }
+                    actions = Plan(buttons, wanted, scriptActions, edits);
 
                     if (edits.Count > 0)
                     {
@@ -1140,7 +1257,7 @@ namespace Dcd
             public Btn B;
             public bool On, WasOn, Can;
             public int Ms, WasMs;
-            public bool Changed { get { return On != WasOn || (On && Ms != WasMs); } }
+            public bool Changed { get { return On != WasOn || (On && Ms != WasMs) || (On && B.Stale); } }
         }
 
         enum K { Up, Down, Left, Right, Toggle, Enter, Quit, Remove, Profile, Yes, Other }
@@ -1152,6 +1269,7 @@ namespace Dcd
 
         static JNode Root, Profile;
         static List<JNode> Profiles;
+        static List<JNode> Mice = new List<JNode>();   // connected G502s, as G HUB reports them
         static int ProfileIndex, Cursor;
         static List<Row> Rows;
         static string Msg;
@@ -1290,9 +1408,26 @@ namespace Dcd
             IntPtr db;
             Root = LoadFile(false, out db).Root;
             Sql.Close(db);
+            Mice = new List<JNode>();
+            if (Live)
+                foreach (JNode d in Api().Devices())
+                {
+                    string name = d.S("displayName") ?? "", prefix = d.S("slotPrefix") ?? "";
+                    if (name.ToUpperInvariant().Contains("G502") || prefix.StartsWith("g502"))
+                    {
+                        Mice.Add(d);
+                        if (prefix.Length > 0 && !G502Prefixes.Contains(prefix)) G502Prefixes.Add(prefix);
+                    }
+                }
             Profiles = G502Profiles(Root);
             if (Profiles.Count == 0)
-                throw new Abort("No G502 mouse found in G HUB. Connect the mouse, open G HUB once, then run this again.");
+            {
+                if (Mice.Count > 0)
+                    throw new Abort("G HUB sees your " + Mice[0].S("displayName") + " but has no button settings for it yet.\n" +
+                                    "Open G HUB, click the mouse and open its button assignments once, then run this again.");
+                throw new Abort("No G502 mouse found in G HUB. Connect the mouse, open G HUB once, then run this again.\n" +
+                                "Supported: G502 LIGHTSPEED, G502 HERO, G502 Proteus Spectrum / Core (other G502 models may work).");
+            }
             ProfileIndex = -1;
             for (int i = 0; i < Profiles.Count; i++) if (Profiles[i].S("id") == keepProfileId) ProfileIndex = i;
             if (ProfileIndex < 0)
@@ -1306,16 +1441,20 @@ namespace Dcd
         static void BuildRows()
         {
             Profile = Profiles[ProfileIndex];
-            Dictionary<int, int> periods = CurrentPeriods(ReadProfileScript(Profile));
+            string script = ReadProfileScript(Profile);
+            Dictionary<int, int> periods = CurrentPeriods(script);
             Rows = new List<Row>();
-            foreach (Btn b in Buttons(Root, Profile).Values)
+            foreach (Btn b in Buttons(Root, Profile, ScriptActions(script)).Values)
             {
                 Row r = new Row();
                 r.B = b;
-                r.On = r.WasOn = b.Fixed;
-                r.Can = b.Fixed || (b.Action != null && !b.Busy);
+                r.WasOn = b.Fixed || b.Overridden || b.InScript;
+                // A button changed in G HUB stays fixed if its current action can be run by the script.
+                r.On = b.Fixed || ((b.Overridden || b.InScript) && b.Action != null && !b.Busy);
+                r.Can = r.WasOn || (b.Action != null && !b.Busy);
                 int ms;
-                r.Ms = r.WasMs = b.Fixed && periods.TryGetValue(b.N, out ms) ? ms : 0;
+                r.Ms = r.WasMs = r.WasOn && periods.TryGetValue(b.N, out ms) ? ms : 0;
+                if (r.On && r.Ms == 0) r.Ms = IsClick(b.N) ? DefaultClickMs : DefaultMs;
                 Rows.Add(r);
             }
             if (Cursor < 0 || Cursor >= Rows.Count || !Rows[Cursor].Can) Cursor = NextCan(-1, 1);
@@ -1349,12 +1488,29 @@ namespace Dcd
             W(" DOUBLE CLICK DESTROYER 5000", ConsoleColor.Cyan); NL();
             W(" Stops Logitech G502 buttons from double-clicking. Your G HUB macros stay.", Dim); NL();
             NL();
+            foreach (JNode m in Mice)
+            {
+                W(" Mouse: ", Txt); W(m.S("displayName") ?? "G502", Hot); NL();
+                JNode onboard = m.Get("onboardMode");
+                if (onboard != null && onboard.Str == "true")
+                {
+                    W(" ! This mouse is in on-board memory mode. G HUB scripts don't run in that mode, so the fix", ConsoleColor.Yellow); NL();
+                    W("   won't work. Turn on-board memory mode off in G HUB (the mouse's settings), then apply.", ConsoleColor.Yellow); NL();
+                }
+            }
             W(" G HUB profile: ", Txt); W(AppName(Root, Profile), Hot);
             if (Profiles.Count > 1) W("   (" + (ProfileIndex + 1) + " of " + Profiles.Count + ", P = next profile)", Dim);
+            NL();
+            List<string> fixedOn = new List<string>();
+            foreach (JNode p in Profiles)
+                foreach (Btn b in Buttons(Root, p).Values) if (b.Fixed) { fixedOn.Add(AppName(Root, p)); break; }
+            W(" The fix only applies to this profile. ", Dim);
+            W(fixedOn.Count > 0 ? "Fix active on: " + string.Join(", ", fixedOn.ToArray()) : "No profile has the fix yet.", Dim);
             NL(); NL();
             W("         Button                              Does                         Ignore repeats", Dim); NL();
 
             bool anyGrey = false;
+            List<string> notes = new List<string>(), problems = new List<string>();
             for (int i = 0; i < Rows.Count; i++)
             {
                 Row r = Rows[i];
@@ -1362,11 +1518,16 @@ namespace Dcd
                 W(i == Cursor ? "  > " : "    ", Hot);
                 if (!r.Can) { W("    ", Txt); anyGrey = true; }
                 else W(r.On ? "[x] " : "[ ] ", r.Changed ? ConsoleColor.Yellow : r.On ? ConsoleColor.Green : Txt);
-                W(" " + ("G" + r.B.N).PadRight(5), r.Can ? Hot : Dim);
+                W(r.B.Drift != null ? "!" : " ", ConsoleColor.Yellow);
+                W(("G" + r.B.N).PadRight(5), r.Can ? Hot : Dim);
                 W(Fit(ButtonName(r.B.N), 30), r.Can ? Txt : Dim);
                 W(Fit(r.B.Busy ? "G-Shift slot in use" : r.B.Label, 29), r.Can ? Txt : Dim);
                 if (r.On) W(r.Ms + " ms", r.Changed ? ConsoleColor.Yellow : ConsoleColor.Green);
                 NL();
+                if (r.B.Drift != null)
+                    notes.Add("G" + r.B.N + ": " + r.B.Drift + (r.B.Stale ? " - Enter updates the fix." : "."));
+                else if (r.B.Problem != null && !r.B.Fixed)
+                    problems.Add("G" + r.B.N + " can't be fixed: " + r.B.Problem + ".");
             }
             if (Rows.Count == 0 || Cursor < 0) { W("    No button on this profile can be fixed.", ConsoleColor.Yellow); NL(); }
             NL();
@@ -1380,6 +1541,12 @@ namespace Dcd
             NL();
             int changes = Changes();
             if (changes > 0) { W(" " + changes + " change" + (changes == 1 ? "" : "s") + " not applied yet - press Enter to apply.", ConsoleColor.Yellow); NL(); }
+            if (notes.Count > 0)
+            {
+                W(" ! = changed in G HUB since the fix was applied:", ConsoleColor.Yellow); NL();
+                foreach (string note in notes) { W("   " + note, ConsoleColor.Yellow); NL(); }
+            }
+            foreach (string p in problems) { W(" " + p, ConsoleColor.Yellow); NL(); }
             if (Cursor >= 0 && IsClick(Rows[Cursor].B.N))
             {
                 W(" Click buttons: keep the ignore time short (about 40-80 ms) or real double-clicks get blocked.", Dim); NL();
@@ -1428,7 +1595,7 @@ namespace Dcd
 
             string profileId = Profile.S("id");
             ClearScreen();
-            Console.WriteLine(" Applying...");
+            Console.WriteLine(" Applying... Don't change anything in G HUB until this finishes.");
             string backup;
             try
             {
@@ -1477,6 +1644,12 @@ namespace Dcd
                         case K.Down: Cursor = NextCan(Cursor, 1); break;
                         case K.Toggle:
                             if (row == null) break;
+                            if (!row.On && row.B.Action == null && !row.B.Fixed)
+                            {
+                                Msg = "G" + row.B.N + " can't be fixed: " + (row.B.Problem ?? "assign it a macro, a key or a mouse button in G HUB first") + ".";
+                                MsgColor = ConsoleColor.Yellow;
+                                break;
+                            }
                             row.On = !row.On;
                             if (row.On && row.Ms == 0) row.Ms = DefaultMsFor(row);
                             break;
